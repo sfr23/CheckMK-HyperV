@@ -1,15 +1,15 @@
-# hv_cluster_health.ps1 - Checkmk Local Check: clusterweite Sicht eines Hyper-V-Failover-Clusters
-# Module:  hv_cluster_health.ps1  (dieses Skript, alle Cluster)
-#          hv_s2d_health.ps1      (nur S2D, erkennt sich selbst)
-#          hv_node_health.ps1     (knotenspezifisch)
-# Ablage auf JEDEM Clusterknoten: C:\ProgramData\checkmk\agent\local\
-# Die Ausgabe ist auf allen Knoten identisch -> in Checkmk per Regel "Clustered services"
-# auf den Cluster-Host ziehen (Regex: ^HV Cluster )
-# Auto-Erkennung: kein Failover-Clustering installiert -> keine Ausgabe
-# Ausgabeformat: <Status> "<Servicename>" <Metriken> <Text>  (ohne Umlaute)
+# hv_cluster_health.ps1 - Checkmk local check: cluster-wide view of a Hyper-V failover cluster
+# Modules: hv_cluster_health.ps1  (this script, all clusters)
+#          hv_s2d_health.ps1      (S2D only, self-detecting)
+#          hv_node_health.ps1     (node-specific)
+# Deploy to EVERY cluster node: C:\ProgramData\checkmk\agent\local\
+# Output is identical on all nodes -> assign to the cluster host in Checkmk
+# via the "Clustered services" rule (regex: ^HV Cluster )
+# Auto-detection: Failover Clustering not installed -> no output
+# Output format: <state> "<service name>" <metrics> <text>  (ASCII only)
 
 $ErrorActionPreference = 'Stop'
-# Punkt als Dezimaltrenner erzwingen (Agent laeuft als SYSTEM, ggf. mit de-DE)
+# Force dot as decimal separator (agent runs as SYSTEM, possibly with de-DE culture)
 [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
 
 function Out-Check($state, $name, $perf, $text) {
@@ -19,25 +19,25 @@ function Out-Check($state, $name, $perf, $text) {
 }
 
 # =====================================================================
-# Voraussetzungen / Auto-Erkennung
+# Prerequisites / auto-detection
 # =====================================================================
-if (-not (Get-Command Get-Cluster -ErrorAction SilentlyContinue)) { return }   # kein Clusterknoten
+if (-not (Get-Command Get-Cluster -ErrorAction SilentlyContinue)) { return }   # not a cluster node
 try {
     $cluster = Get-Cluster
 } catch {
-    Out-Check 2 'HV Cluster Service' '-' "Cluster auf $env:COMPUTERNAME nicht erreichbar: $($_.Exception.Message)"
+    Out-Check 2 'HV Cluster Service' '-' "Cluster not reachable from $env:COMPUTERNAME: $($_.Exception.Message)"
     return
 }
-$isS2D = ($cluster.S2DEnabled -eq 1)   # Health Service nur bei S2D vorhanden
+$isS2D = ($cluster.S2DEnabled -eq 1)   # Health Service only exists with S2D
 
 # =====================================================================
-# Clusterknoten
+# Cluster nodes
 # =====================================================================
 try {
     foreach ($node in Get-ClusterNode) {
         $state = switch ("$($node.State)") {
             'Up'      { 0 }
-            'Paused'  { 1 }   # Wartung / Drain
+            'Paused'  { 1 }   # maintenance / drain
             'Joining' { 1 }
             'Down'    { 2 }
             default   { 3 }
@@ -46,13 +46,13 @@ try {
             "State: $($node.State), DrainStatus: $($node.DrainStatus)"
     }
 } catch {
-    Out-Check 3 'HV Cluster Node Status' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+    Out-Check 3 'HV Cluster Node Status' '-' "Query failed: $($_.Exception.Message)"
 }
 
 # =====================================================================
-# Cluster-Rollen (VMs und sonstige Rollen, ohne Core-Gruppen)
+# Cluster roles (VMs and other roles, excluding core groups)
 #   Failed -> CRIT
-#   Offline / PartialOnline / Pending -> nur Info im Text (ausgeschaltet = erwartet)
+#   Offline / PartialOnline / Pending -> info in text only (powered off = expected)
 # =====================================================================
 try {
     $groups = @(Get-ClusterGroup | Where-Object { -not $_.IsCoreGroup -and "$($_.GroupType)" -ne 'AvailableStorage' })
@@ -64,27 +64,27 @@ try {
 
     $dist = ($groups | Group-Object { "$($_.OwnerNode)" } | Sort-Object Name |
              ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', '
-    $text = "$($groups.Count) Rollen, $($online.Count) Online, $($failed.Count) Failed, $($other.Count) sonstige, Verteilung: $dist"
+    $text = "$($groups.Count) roles, $($online.Count) online, $($failed.Count) failed, $($other.Count) other, distribution: $dist"
     if ($failed.Count -gt 0) {
-        $text += ' - FAILED: ' + (($failed | ForEach-Object { "$($_.Name) auf $($_.OwnerNode)" }) -join ', ')
+        $text += ' - FAILED: ' + (($failed | ForEach-Object { "$($_.Name) on $($_.OwnerNode)" }) -join ', ')
     }
     if ($other.Count -gt 0) {
         $text += ' - Info: ' + (($other | ForEach-Object { "$($_.Name) ($($_.State))" }) -join ', ')
     }
     Out-Check $state 'HV Cluster Roles' "roles=$($groups.Count)|online=$($online.Count)|failed=$($failed.Count)|other=$($other.Count)" $text
 } catch {
-    Out-Check 3 'HV Cluster Roles' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+    Out-Check 3 'HV Cluster Roles' '-' "Query failed: $($_.Exception.Message)"
 }
 
 # =====================================================================
-# Memory N+1: passen alle laufenden VMs noch, wenn ein Knoten ausfaellt?
-# Pro Ausfallszenario: (Nutzung der verbleibenden Knoten + Gast-RAM des ausgefallenen Knotens)
-#                      / Gesamt-RAM der verbleibenden Knoten
-# Bewertet wird das schlechteste Szenario.
-# Datenquelle:
-#   S2D:      Health Service (Get-ClusterPerf), kein Remotezugriff noetig
-#   ohne S2D: WinRM/CIM + Get-VM auf die anderen Knoten. Das Computerkonto dieses
-#             Knotens braucht dort lokale Admin- bzw. Hyper-V-Administratorrechte.
+# Memory N+1: do all running VMs still fit if one node fails?
+# Per failure scenario: (usage of remaining nodes + guest RAM of the failed node)
+#                       / total RAM of remaining nodes
+# The worst scenario is evaluated.
+# Data source:
+#   S2D:     Health Service (Get-ClusterPerf), no remote access required
+#   no S2D:  WinRM/CIM + Get-VM against the other nodes. This node's computer account
+#            needs local admin or Hyper-V Administrators rights there.
 # =====================================================================
 $nplusWarnPct = 90
 $nplusCritPct = 95
@@ -103,7 +103,7 @@ function Get-NodeMemory($nodeName) {
             }
         }
     }
-    # Fallback: CIM / Hyper-V direkt (lokal ohne, sonst mit Remotezugriff)
+    # Fallback: CIM / Hyper-V directly (local without, otherwise with remote access)
     if ($nodeName -ieq $env:COMPUTERNAME) {
         $os  = Get-CimInstance Win32_OperatingSystem
         $vms = @(Get-VM)
@@ -129,9 +129,9 @@ try {
     }
 
     if ($errors.Count -gt 0) {
-        Out-Check 3 'HV Cluster Memory N+1' '-' "Abfrage fehlgeschlagen - $($errors -join '; ')"
+        Out-Check 3 'HV Cluster Memory N+1' '-' "Query failed - $($errors -join '; ')"
     } elseif ($mem.Count -lt 2) {
-        Out-Check 1 'HV Cluster Memory N+1' '-' "Nicht berechenbar: nur $($mem.Count) Knoten Up (keine N+1-Redundanz)"
+        Out-Check 1 'HV Cluster Memory N+1' '-' "Cannot calculate: only $($mem.Count) node(s) up (no N+1 redundancy)"
     } else {
         $worst = -1
         $scen  = @()
@@ -140,7 +140,7 @@ try {
             $tot  = ($surv | ForEach-Object { $mem[$_].Total } | Measure-Object -Sum).Sum
             $use  = ($surv | ForEach-Object { $mem[$_].Usage } | Measure-Object -Sum).Sum + $mem[$f].Guest
             $pct  = [math]::Round($use / $tot * 100, 1)
-            $scen += "Ausfall $f -> $pct% ($([math]::Round($use/1GB)) von $([math]::Round($tot/1GB)) GB, +$([math]::Round($mem[$f].Guest/1GB)) GB Gaeste)"
+            $scen += "Failure of $f -> $pct% ($([math]::Round($use/1GB)) of $([math]::Round($tot/1GB)) GB, +$([math]::Round($mem[$f].Guest/1GB)) GB guests)"
             if ($pct -gt $worst) { $worst = $pct }
         }
 
@@ -154,16 +154,16 @@ try {
         $src = if ($isS2D) { 'Health Service' } else { 'CIM/Hyper-V' }
 
         Out-Check $state 'HV Cluster Memory N+1' "nplus1_pct=$worst;$nplusWarnPct;$nplusCritPct;0;100" `
-            "Worst Case nach Failover: $worst% - aktuell: $now - $($scen -join '; ') (Quelle: $src)"
+            "Worst case after failover: $worst% - current: $now - $($scen -join '; ') (source: $src)"
     }
 } catch {
-    Out-Check 3 'HV Cluster Memory N+1' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+    Out-Check 3 'HV Cluster Memory N+1' '-' "Query failed: $($_.Exception.Message)"
 }
 
 # =====================================================================
-# Quorum / Witness
-#   Witness Online = OK, Pending = WARN, sonst CRIT
-#   Kein Witness: bei <= 2 Knoten CRIT, sonst WARN
+# Quorum / witness
+#   Witness Online = OK, Pending = WARN, otherwise CRIT
+#   No witness: CRIT with <= 2 nodes, otherwise WARN
 # =====================================================================
 try {
     $q     = Get-ClusterQuorum
@@ -178,23 +178,23 @@ try {
             'OnlinePending' { 1 }
             default         { 2 }
         }
-        $text = "Typ: $($q.QuorumType), Witness: $($res.Name) ($($res.ResourceType)) $($res.State), Stimmen: $votes Knoten + Witness $wVote"
+        $text = "Type: $($q.QuorumType), witness: $($res.Name) ($($res.ResourceType)) $($res.State), votes: $votes node(s) + witness $wVote"
     } else {
         $state = if ($nodes.Count -le 2) { 2 } else { 1 }
-        $text  = "Typ: $($q.QuorumType), KEIN Witness konfiguriert, Stimmen: $votes Knoten"
+        $text  = "Type: $($q.QuorumType), NO witness configured, votes: $votes node(s)"
     }
     Out-Check $state 'HV Cluster Quorum' "node_votes=$votes|witness_vote=$wVote" $text
 } catch {
-    Out-Check 3 'HV Cluster Quorum' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+    Out-Check 3 'HV Cluster Quorum' '-' "Query failed: $($_.Exception.Message)"
 }
 
 # =====================================================================
-# CSV: Status und Zugriffsmodus pro Knoten (ein Service pro CSV)
-#   Direct                           -> OK (Sollzustand bei NTFS, z.B. SAN)
-#   FileSystemRedirected wegen ReFS  -> OK (bei ReFS by design, z.B. S2D)
-#   sonstiges FileSystemRedirected   -> WARN (z.B. inkompatibler Filtertreiber, Backup)
-#   BlockRedirected                  -> WARN (Knoten ohne eigenen Pfad zum Datentraeger)
-#   CSV nicht Online / Unavailable   -> CRIT
+# CSV: state and access mode per node (one service per CSV)
+#   Direct                           -> OK (expected state with NTFS, e.g. SAN)
+#   FileSystemRedirected due to ReFS -> OK (by design with ReFS, e.g. S2D)
+#   other FileSystemRedirected       -> WARN (e.g. incompatible filter driver, backup)
+#   BlockRedirected                  -> WARN (node has no direct path to the disk)
+#   CSV not Online / Unavailable     -> CRIT
 # =====================================================================
 try {
     $csvList   = @(Get-ClusterSharedVolume)
@@ -228,17 +228,17 @@ try {
         }
 
         $modes = ($rows | Sort-Object Node | ForEach-Object { "$($_.Node)=$($_.StateInfo)" }) -join ', '
-        $text  = "Status: $($csv.State), Owner: $($csv.OwnerNode), Modus: $modes"
+        $text  = "State: $($csv.State), owner: $($csv.OwnerNode), mode: $modes"
         if ($issues.Count -gt 0) { $text += ' - ' + ($issues -join ', ') }
         Out-Check $state "HV Cluster CSV $short" '-' $text
     }
 } catch {
-    Out-Check 3 'HV Cluster CSV' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+    Out-Check 3 'HV Cluster CSV' '-' "Query failed: $($_.Exception.Message)"
 }
 
 # =====================================================================
-# CSV-Belegung (ein Service pro CSV)
-# Bei S2D zusaetzlich zur Pool-Reserve, bei SAN die einzige Kapazitaetssicht
+# CSV usage (one service per CSV)
+# With S2D in addition to the pool reserve, with SAN the only capacity view
 # =====================================================================
 $csvWarnPct = 85
 $csvCritPct = 95
@@ -247,7 +247,7 @@ try {
         $short = "$($csv.Name)" -replace '^Cluster Virtual Disk \((.*)\)$', '$1'
         $part  = $csv.SharedVolumeInfo | Select-Object -First 1 -ExpandProperty Partition
         if (-not $part -or -not $part.Size) {
-            Out-Check 3 "HV Cluster CSV Space $short" '-' 'Keine Partitionsdaten (CSV offline?)'
+            Out-Check 3 "HV Cluster CSV Space $short" '-' 'No partition data (CSV offline?)'
             continue
         }
         $usedPct = [math]::Round(($part.Size - $part.FreeSpace) / $part.Size * 100, 1)
@@ -259,15 +259,15 @@ try {
         elseif ($usedPct -ge $csvWarnPct) { $state = 1 }
 
         Out-Check $state "HV Cluster CSV Space $short" "used_pct=$usedPct;$csvWarnPct;$csvCritPct;0;100|free_tb=$freeTB;;;0;$sizeTB" `
-            "$usedPct% belegt, $freeTB TB frei von $sizeTB TB ($($part.FileSystem))"
+            "$usedPct% used, $freeTB TB free of $sizeTB TB ($($part.FileSystem))"
     }
 } catch {
-    Out-Check 3 'HV Cluster CSV Space' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+    Out-Check 3 'HV Cluster CSV Space' '-' "Query failed: $($_.Exception.Message)"
 }
 
 # =====================================================================
-# Cluster-Disks, die keine CSV sind (z.B. Disk-Witness, Disks in "Available Storage")
-#   Online -> OK, sonst CRIT
+# Cluster disks that are not CSVs (e.g. disk witness, disks in "Available Storage")
+#   Online -> OK, otherwise CRIT
 # =====================================================================
 try {
     $csvNames = @(Get-ClusterSharedVolume | ForEach-Object { "$($_.Name)" })
@@ -275,16 +275,16 @@ try {
                 "$($_.ResourceType)" -eq 'Physical Disk' -and $csvNames -notcontains "$($_.Name)" })) {
         $state = if ("$($disk.State)" -eq 'Online') { 0 } else { 2 }
         Out-Check $state "HV Cluster Disk $($disk.Name)" '-' `
-            "State: $($disk.State), Gruppe: $($disk.OwnerGroup), Owner: $($disk.OwnerNode)"
+            "State: $($disk.State), group: $($disk.OwnerGroup), owner: $($disk.OwnerNode)"
     }
 } catch {
-    Out-Check 3 'HV Cluster Disk' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+    Out-Check 3 'HV Cluster Disk' '-' "Query failed: $($_.Exception.Message)"
 }
 
 # =====================================================================
-# Network ATC - ein Service pro Intent, bewertet ueber alle Hosts
-# Nur wenn Network ATC vorhanden und Intents definiert sind
-# OK nur bei ConfigurationStatus = Success UND ProvisioningStatus = Completed
+# Network ATC - one service per intent, evaluated across all hosts
+# Only if Network ATC is available and intents are defined
+# OK only if ConfigurationStatus = Success AND ProvisioningStatus = Completed
 # =====================================================================
 if (Get-Command Get-NetIntentStatus -ErrorAction SilentlyContinue) {
     try {
@@ -295,15 +295,15 @@ if (Get-Command Get-NetIntentStatus -ErrorAction SilentlyContinue) {
             })
             $state = 0
             if ($bad.Count -gt 0) {
-                $state = 1   # z.B. Provisioning/Validating/Retrying
+                $state = 1   # e.g. Provisioning/Validating/Retrying
                 if ($bad | Where-Object { "$($_.ConfigurationStatus)$($_.ProvisioningStatus)" -match 'Fail' }) { $state = 2 }
             }
             $detail = ($bad | ForEach-Object { "$($_.Host): $($_.ConfigurationStatus)/$($_.ProvisioningStatus)" }) -join ', '
-            if (-not $detail) { $detail = 'alle Hosts Success/Completed' }
+            if (-not $detail) { $detail = 'all hosts Success/Completed' }
             Out-Check $state "HV Cluster NetATC $($grp.Name)" "hosts=$($grp.Count)|bad=$($bad.Count)" `
-                "$($grp.Count) Hosts, $($bad.Count) abweichend - $detail"
+                "$($grp.Count) hosts, $($bad.Count) deviating - $detail"
         }
     } catch {
-        Out-Check 3 'HV Cluster NetATC' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+        Out-Check 3 'HV Cluster NetATC' '-' "Query failed: $($_.Exception.Message)"
     }
 }

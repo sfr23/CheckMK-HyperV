@@ -1,14 +1,14 @@
-# hv_node_health.ps1 - Checkmk Local Check: knotenspezifische Sicht eines Hyper-V-Hosts
-# Module:  hv_cluster_health.ps1  (alle Cluster)
-#          hv_s2d_health.ps1      (nur S2D)
-#          hv_node_health.ps1     (dieses Skript, knotenspezifisch)
-# Ablage auf JEDEM Hyper-V-Host: C:\ProgramData\checkmk\agent\local\
-# Diese Services bleiben am jeweiligen Knoten (NICHT in "Clustered services" aufnehmen).
-# Auto-Erkennung: SET, MPIO, FC und iSCSI erscheinen nur, wenn vorhanden.
-# Ausgabeformat: <Status> "<Servicename>" <Metriken> <Text>  (ohne Umlaute)
+# hv_node_health.ps1 - Checkmk local check: node-specific view of a Hyper-V host
+# Modules: hv_cluster_health.ps1  (all clusters)
+#          hv_s2d_health.ps1      (S2D only)
+#          hv_node_health.ps1     (this script, node-specific)
+# Deploy to EVERY Hyper-V host: C:\ProgramData\checkmk\agent\local\
+# These services stay on their node (do NOT add them to "Clustered services").
+# Auto-detection: SET, MPIO, FC and iSCSI only appear if present.
+# Output format: <state> "<service name>" <metrics> <text>  (ASCII only)
 
 $ErrorActionPreference = 'Stop'
-# Punkt als Dezimaltrenner erzwingen (Agent laeuft als SYSTEM, ggf. mit de-DE)
+# Force dot as decimal separator (agent runs as SYSTEM, possibly with de-DE culture)
 [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
 
 function Out-Check($state, $name, $perf, $text) {
@@ -20,9 +20,9 @@ function Out-Check($state, $name, $perf, $text) {
 $hasHyperV = [bool](Get-Command Get-VM -ErrorAction SilentlyContinue)
 
 # =====================================================================
-# Patchlevel: Build.UBR, Alter des letzten Updates, Reboot ausstehend
-# Hinweis: Get-HotFix (Win32_QuickFixEngineering) liefert nicht immer ein InstalledOn;
-# Eintraege ohne Datum werden ignoriert.
+# Patch level: Build.UBR, age of the last update, pending reboot
+# Note: Get-HotFix (Win32_QuickFixEngineering) does not always return InstalledOn;
+# entries without a date are ignored.
 # =====================================================================
 $patchWarnDays = 45
 $patchCritDays = 75
@@ -44,21 +44,21 @@ try {
     elseif ($age -ge $patchWarnDays) { $state = 1 }
     if ($rebootPending) { $state = [math]::Max($state, 1) }
 
-    $lastText = if ($last) { "$($last.HotFixID) am $($last.InstalledOn.ToString('yyyy-MM-dd')) ($age Tage)" } else { 'unbekannt' }
-    $rbText   = if ($rebootPending) { ', REBOOT AUSSTEHEND' } else { '' }
+    $lastText = if ($last) { "$($last.HotFixID) on $($last.InstalledOn.ToString('yyyy-MM-dd')) ($age days)" } else { 'unknown' }
+    $rbText   = if ($rebootPending) { ', REBOOT PENDING' } else { '' }
 
     Out-Check $state 'HV Host Patchlevel' "patch_age_days=$age;$patchWarnDays;$patchCritDays" `
-        "Build $build, letztes Update: $lastText$rbText"
+        "Build $build, last update: $lastText$rbText"
 } catch {
-    Out-Check 3 'HV Host Patchlevel' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+    Out-Check 3 'HV Host Patchlevel' '-' "Query failed: $($_.Exception.Message)"
 }
 
 # =====================================================================
-# SET-Uplinks: physische Member-Adapter jedes Switch Embedded Teaming vSwitch
-#   alle Uplinks Up, gleiche Geschwindigkeit -> OK
-#   einzelne Uplinks down / fehlend          -> WARN (keine Redundanz mehr)
-#   unterschiedliche Link-Speeds              -> WARN
-#   kein Uplink Up                            -> CRIT
+# SET uplinks: physical member adapters of each Switch Embedded Teaming vSwitch
+#   all uplinks Up, same speed               -> OK
+#   individual uplinks down / missing        -> WARN (no redundancy left)
+#   differing link speeds                    -> WARN
+#   no uplink Up                             -> CRIT
 # =====================================================================
 if ($hasHyperV) {
     try {
@@ -75,20 +75,20 @@ if ($hasHyperV) {
             elseif ($speeds.Count -gt 1)        { $state = 1 }
 
             $detail = ($nics | Sort-Object Name | ForEach-Object { "$($_.Name): $($_.Status) $($_.LinkSpeed)" }) -join ', '
-            if ($missing -gt 0)      { $detail += ", $missing Adapter nicht gefunden" }
-            if ($speeds.Count -gt 1) { $detail += ', UNTERSCHIEDLICHE LINK-SPEEDS' }
+            if ($missing -gt 0)      { $detail += ", $missing adapter(s) not found" }
+            if ($speeds.Count -gt 1) { $detail += ', MISMATCHED LINK SPEEDS' }
 
             Out-Check $state "HV Host SET $($sw.Name)" "uplinks=$($descs.Count)|up=$($up.Count)" `
-                "$($up.Count) von $($descs.Count) Uplinks Up - $detail"
+                "$($up.Count) of $($descs.Count) uplinks up - $detail"
         }
     } catch {
-        Out-Check 3 'HV Host SET' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+        Out-Check 3 'HV Host SET' '-' "Query failed: $($_.Exception.Message)"
     }
 }
 
 # =====================================================================
-# Checkpoints der VMs, die aktuell auf DIESEM Knoten laufen
-# (Detail pro VM liefert der offizielle Check "Hyper-V VM Checkpoints")
+# Checkpoints of VMs currently running on THIS node
+# (per-VM detail is provided by the official check "Hyper-V VM Checkpoints")
 # =====================================================================
 $cpWarnDays = 3
 $cpCritDays = 7
@@ -104,30 +104,30 @@ if ($hasHyperV) {
         }
         $oldest = $cps | Sort-Object CreationTime | Select-Object -First 1
         $oText  = if ($oldest) {
-            "aeltester: $($oldest.VMName) / $($oldest.Name) ($([int]($now - $oldest.CreationTime).TotalDays) Tage)"
-        } else { 'keine Checkpoints' }
+            "oldest: $($oldest.VMName) / $($oldest.Name) ($([int]($now - $oldest.CreationTime).TotalDays) days)"
+        } else { 'no checkpoints' }
         $maxAge = if ($oldest) { [math]::Round(($now - $oldest.CreationTime).TotalDays, 1) } else { 0 }
 
         Out-Check $state 'HV Host Checkpoints' "checkpoints=$($cps.Count)|old=$($old.Count)|max_age_days=$maxAge;$cpWarnDays;$cpCritDays" `
-            "$($cps.Count) Checkpoints, $($old.Count) aelter als $cpWarnDays Tage, $oText"
+            "$($cps.Count) checkpoints, $($old.Count) older than $cpWarnDays days, $oText"
     } catch {
-        Out-Check 3 'HV Host Checkpoints' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+        Out-Check 3 'HV Host Checkpoints' '-' "Query failed: $($_.Exception.Message)"
     }
 }
 
 # =====================================================================
-# MPIO: Pfade pro LUN (FC und iSCSI)
-# $mpioExpectedPaths = 0 -> Sollwert = hoechste Pfadanzahl aller LUNs (auto)
-#   ACHTUNG auto: faellt bei allen LUNs gleichzeitig ein Pfad weg (z.B. ganze Fabric),
-#   sinkt auch der Sollwert -> dann greifen FC-Ports/iSCSI unten. Besser fest eintragen.
-#   weniger Pfade als Soll -> WARN, nur noch 1 Pfad (bei Soll > 1) -> CRIT
+# MPIO: paths per LUN (FC and iSCSI)
+# $mpioExpectedPaths = 0 -> expected value = highest path count of all LUNs (auto)
+#   CAUTION auto: if all LUNs lose a path at the same time (e.g. an entire fabric),
+#   the expected value drops too -> then the FC ports/iSCSI checks below apply. Better set a fixed value.
+#   fewer paths than expected -> WARN, only 1 path left (when expected > 1) -> CRIT
 # =====================================================================
 $mpioExpectedPaths = 0
 $mpioDisks = @()
 try {
     $mpioDisks = @(Get-CimInstance -Namespace root\wmi -ClassName MPIO_DISK_INFO -ErrorAction Stop |
                    ForEach-Object { $_.DriveInfo } | Where-Object { $_ })
-} catch { }   # MPIO nicht installiert -> keine Ausgabe
+} catch { }   # MPIO not installed -> no output
 
 if ($mpioDisks.Count -gt 0) {
     try {
@@ -142,23 +142,23 @@ if ($mpioDisks.Count -gt 0) {
         elseif ($degraded.Count -gt 0)                    { $state = 1 }
 
         $minPaths = ($mpioDisks | Measure-Object NumberPaths -Minimum).Minimum
-        $mode     = if ($mpioExpectedPaths -gt 0) { 'fest' } else { 'auto' }
-        $text     = "$($mpioDisks.Count) LUNs, Soll $expected Pfade ($mode), minimal $minPaths"
+        $mode     = if ($mpioExpectedPaths -gt 0) { 'fixed' } else { 'auto' }
+        $text     = "$($mpioDisks.Count) LUNs, expected $expected paths ($mode), minimum $minPaths"
         if ($degraded.Count -gt 0) {
             $text += ' - ' + (($degraded | ForEach-Object {
-                "$($_.Name) SN $("$($_.SerialNumber)".Trim()): $($_.NumberPaths) Pfade"
+                "$($_.Name) SN $("$($_.SerialNumber)".Trim()): $($_.NumberPaths) paths"
             }) -join ', ')
         }
         Out-Check $state 'HV Host MPIO' "luns=$($mpioDisks.Count)|min_paths=$minPaths|degraded=$($degraded.Count)" $text
     } catch {
-        Out-Check 3 'HV Host MPIO' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+        Out-Check 3 'HV Host MPIO' '-' "Query failed: $($_.Exception.Message)"
     }
 }
 
 # =====================================================================
-# FC-HBA-Ports
-#   alle Ports Online -> OK, einzelne nicht Online -> WARN, keiner Online -> CRIT
-#   Bewusst ungenutzte Ports per WWPN ausnehmen (Format wie PortAddress, z.B. '10000090FA123456')
+# FC HBA ports
+#   all ports Online -> OK, some not Online -> WARN, none Online -> CRIT
+#   Exclude intentionally unused ports by WWPN (same format as PortAddress, e.g. '10000090FA123456')
 # =====================================================================
 $fcIgnorePorts = @()
 $fcPorts = @()
@@ -180,18 +180,18 @@ if ($fcPorts.Count -gt 0) {
             "WWPN $($_.PortAddress): $($_.OperationalStatus -join ',')"
         }) -join ', '
         Out-Check $state 'HV Host FC Ports' "ports=$($fcPorts.Count)|online=$($on.Count)" `
-            "$($on.Count) von $($fcPorts.Count) Ports Online - $detail"
+            "$($on.Count) of $($fcPorts.Count) ports online - $detail"
     } catch {
-        Out-Check 3 'HV Host FC Ports' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+        Out-Check 3 'HV Host FC Ports' '-' "Query failed: $($_.Exception.Message)"
     }
 }
 
 # =====================================================================
-# iSCSI: Sessions pro Target
-# $iscsiExpectedSessions = 0 -> Sollwert = hoechste Session-Anzahl aller Targets (auto)
-#   Target ohne Session          -> CRIT
-#   weniger Sessions als Soll    -> WARN (Pfadredundanz verloren)
-#   Bewusst ungenutzte Targets per IQN in $iscsiIgnoreTargets ausnehmen
+# iSCSI: sessions per target
+# $iscsiExpectedSessions = 0 -> expected value = highest session count of all targets (auto)
+#   target without session          -> CRIT
+#   fewer sessions than expected    -> WARN (path redundancy lost)
+#   Exclude intentionally unused targets by IQN in $iscsiIgnoreTargets
 # =====================================================================
 $iscsiExpectedSessions = 0
 $iscsiIgnoreTargets    = @()
@@ -221,14 +221,14 @@ if ($iscsiTargets.Count -gt 0) {
         if     ($none.Count -gt 0)     { $state = 2 }
         elseif ($degraded.Count -gt 0) { $state = 1 }
 
-        $mode = if ($iscsiExpectedSessions -gt 0) { 'fest' } else { 'auto' }
-        $text = "$($perTarget.Count) Targets, $($sessions.Count) Sessions, Soll $expected pro Target ($mode)"
+        $mode = if ($iscsiExpectedSessions -gt 0) { 'fixed' } else { 'auto' }
+        $text = "$($perTarget.Count) targets, $($sessions.Count) sessions, expected $expected per target ($mode)"
         $prob = @($none + $degraded)
         if ($prob.Count -gt 0) {
-            $text += ' - ' + (($prob | ForEach-Object { "$($_.Target): $($_.Sessions) Sessions" }) -join ', ')
+            $text += ' - ' + (($prob | ForEach-Object { "$($_.Target): $($_.Sessions) sessions" }) -join ', ')
         }
         Out-Check $state 'HV Host iSCSI' "targets=$($perTarget.Count)|sessions=$($sessions.Count)|degraded=$($prob.Count)" $text
     } catch {
-        Out-Check 3 'HV Host iSCSI' '-' "Abfrage fehlgeschlagen: $($_.Exception.Message)"
+        Out-Check 3 'HV Host iSCSI' '-' "Query failed: $($_.Exception.Message)"
     }
 }
